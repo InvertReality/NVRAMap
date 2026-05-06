@@ -689,7 +689,7 @@ def grep_settings(ifr_text: str, terms: List[str]) -> List[HiiSetting]:
 
         if terms and terms != [""] and not any(t.lower() in (prompt + " " + help_text).lower() for t in terms):
             continue
-        key = (q_id, vs_id, vs_off)
+        key = (vs_id, vs_off)
         if key in seen:
             continue
         seen.add(key)
@@ -706,6 +706,24 @@ def grep_settings(ifr_text: str, terms: List[str]) -> List[HiiSetting]:
 
 VAR_HDR_MAGIC = 0x55AA
 
+def _find_all_nvram_stores(fw: bytes) -> List[Tuple[int, int]]:
+    """
+    Find every EFI variable store in a firmware image.
+    Returns list of (offset, size) for all valid candidates.
+    """
+    n = len(fw)
+    stores = []
+    i = 0
+    while i < n - 28:
+        if fw[i + 20] == 0x5A and fw[i + 21] == 0xFE:
+            size = u32(fw, i + 16)
+            if 0x400 < size < 0x800000 and i + size <= n:
+                aa55_near = fw.find(b'\xaa\x55', i + 28, i + 92)
+                if aa55_near >= 0:
+                    stores.append((i, size))
+        i += 1
+    return stores
+
 
 def _guid_str_to_bytes(gs: str) -> bytes:
     parts = gs.replace("-", "")
@@ -717,17 +735,25 @@ def _guid_str_to_bytes(gs: str) -> bytes:
     return struct.pack("<IHH", a, b, c) + d + e
 
 
-def find_nvram_value(nvram: bytes, guid_str_val: str, var_offset: int, size_bits: int,
-                     var_name: str = "") -> Optional[int]:
+def _probe_var_header(nvram: bytes, guid_pos: int):
     """
-    Scan NVRAM for a variable matching guid_str_val AND var_name.
-    For each GUID hit: read the UTF-16LE name that follows, compare to var_name,
-    and only read data from the matching entry.
+    Locate the variable header owning a GUID hit by probing both layouts:
+      AuthVar (60-byte header): GUID at +44, name at +60
+      VSS     (32-byte header): GUID at +16, name at +32
+    Returns (hdr_offset, name_start_offset) or (None, None).
     """
-    target     = _guid_str_to_bytes(guid_str_val)
-    size_bytes = max(1, size_bits // 8)
-    n          = len(nvram)
+    for guid_off_in_hdr, name_off_in_hdr in ((44, 60), (16, 32)):
+        hdr = guid_pos - guid_off_in_hdr
+        if hdr >= 0 and nvram[hdr] == 0xAA and nvram[hdr + 1] == 0x55:
+            return hdr, hdr + name_off_in_hdr
+    return None, None
 
+
+def _search_nvram_region(nvram: bytes, target: bytes, var_offset: int,
+                          size_bytes: int, var_name: str,
+                          live_result, deleted_result):
+    """Search one NVRAM region, updating live/deleted results. Returns (live, deleted)."""
+    n = len(nvram)
     search_pos = 0
     while search_pos < n - 16:
         guid_pos = nvram.find(target, search_pos)
@@ -735,8 +761,12 @@ def find_nvram_value(nvram: bytes, guid_str_val: str, var_offset: int, size_bits
             break
         search_pos = guid_pos + 1
 
-        # Read the UTF-16LE name that follows the GUID
-        pos = guid_pos + 16
+        hdr, name_start = _probe_var_header(nvram, guid_pos)
+        if hdr is None:
+            continue
+        state = nvram[hdr + 2]
+
+        pos = name_start
         name_chars = []
         while pos + 1 < n:
             lo, hi = nvram[pos], nvram[pos + 1]
@@ -746,11 +776,9 @@ def find_nvram_value(nvram: bytes, guid_str_val: str, var_offset: int, size_bits
             name_chars.append(chr(lo) if hi == 0 else "?")
         found_name = "".join(name_chars)
 
-        # If a var_name was supplied, skip entries that don't match
         if var_name and found_name != var_name:
             continue
 
-        # pos now points at the first data byte
         data_off = pos
         if data_off + var_offset + size_bytes > n:
             continue
@@ -758,23 +786,45 @@ def find_nvram_value(nvram: bytes, guid_str_val: str, var_offset: int, size_bits
         raw = nvram[data_off + var_offset: data_off + var_offset + size_bytes]
         fmt = {1: "B", 2: "<H", 4: "<I", 8: "<Q"}.get(size_bytes, "B")
         try:
-            return struct.unpack(fmt, raw)[0]
+            val = struct.unpack(fmt, raw)[0]
         except struct.error:
             continue
 
-    return None
+        if state == 0x3F:
+            live_result = val
+        elif deleted_result is None:
+            deleted_result = val
+
+    return live_result, deleted_result
+
+
+def find_nvram_value(nvram: bytes, guid_str_val: str, var_offset: int, size_bits: int,
+                     var_name: str = "") -> Optional[int]:
+    target     = _guid_str_to_bytes(guid_str_val)
+    size_bytes = max(1, size_bits // 8)
+
+    live_result    = None
+    deleted_result = None
+
+    for region in (nvram if isinstance(nvram, list) else [nvram]):
+        live_result, deleted_result = _search_nvram_region(
+            region, target, var_offset, size_bytes, var_name,
+            live_result, deleted_result)
+        if live_result is not None:
+            break
+
+    return live_result if live_result is not None else deleted_result
 
 
 def write_nvram_value(nvram_path: str, guid_str_val: str, var_name: str,
                       var_offset: int, size_bits: int, new_value: int) -> bool:
-    """
-    Write new_value at var_offset inside the named NVRAM variable.
-    Modifies the file in-place.
-    """
     nvram = Path(nvram_path).read_bytes()
     target = _guid_str_to_bytes(guid_str_val)
     size_bytes = max(1, size_bits // 8)
     n = len(nvram)
+
+    live_pos    = None
+    deleted_pos = None
 
     search_pos = 0
     while search_pos < n - 16:
@@ -783,7 +833,12 @@ def write_nvram_value(nvram_path: str, guid_str_val: str, var_name: str,
             break
         search_pos = guid_pos + 1
 
-        pos = guid_pos + 16
+        hdr, name_start = _probe_var_header(nvram, guid_pos)
+        if hdr is None:
+            continue
+        state = nvram[hdr + 2]
+
+        pos = name_start
         name_chars = []
         while pos + 1 < n:
             lo, hi = nvram[pos], nvram[pos + 1]
@@ -791,24 +846,30 @@ def write_nvram_value(nvram_path: str, guid_str_val: str, var_name: str,
             if lo == 0 and hi == 0:
                 break
             name_chars.append(chr(lo) if hi == 0 else "?")
-        found_name = "".join(name_chars)
 
-        if found_name != var_name:
+        if "".join(name_chars) != var_name:
             continue
 
         data_off = pos
         write_off = data_off + var_offset
         if write_off + size_bytes > n:
-            return False
+            continue
 
-        fmt = {1: "B", 2: "<H", 4: "<I", 8: "<Q"}.get(size_bytes, "B")
-        packed = struct.pack(fmt, new_value)
-        buf = bytearray(nvram)
-        buf[write_off: write_off + size_bytes] = packed
-        Path(nvram_path).write_bytes(bytes(buf))
-        return True
+        if state == 0x3F:
+            live_pos = write_off
+        elif deleted_pos is None:
+            deleted_pos = write_off
 
-    return False
+    target_off = live_pos if live_pos is not None else deleted_pos
+    if target_off is None:
+        return False
+
+    fmt = {1: "B", 2: "<H", 4: "<I", 8: "<Q"}.get(size_bytes, "B")
+    packed = struct.pack(fmt, new_value)
+    buf = bytearray(nvram)
+    buf[target_off: target_off + size_bytes] = packed
+    Path(nvram_path).write_bytes(bytes(buf))
+    return True
 
 
 
@@ -843,7 +904,7 @@ def reverse_lookup(ifr_text: str, stores: Dict[int, VarStore],
         step      = int(m.group(12), 16)  if m.group(12) else 0
         if vs_id not in matching_vsids:
             continue
-        key = (q_id, vs_id, vs_off)
+        key = (vs_id, vs_off)
         if key in seen:
             continue
         seen.add(key)
@@ -1020,10 +1081,11 @@ EXAMPLE USAGE:\n
     nvramap.py -mode 1 -efi Setup.efi -nvram NVRAM.bin -terms VT-d,IOMMU
     nvramap.py -mode 1 -efi Setup.efi -nvram NVRAM.bin -terms DMA --modify
     nvramap.py -mode 1 -efi Setup.efi -nvram NVRAM.bin -terms DMA --set 2 0x1
+    nvramap.py -mode 1 -efi Setup.efi -firmware firmware.bin -terms DMA --set 2 0x1
 
   Mode 2 — Map NVRAM variables to EFI settings (reverse lookup by GUID + key):
     nvramap.py -mode 2 -efi Setup.efi -nvram NVRAM.bin -guid FB3B9ECE-4ABA-4933-B49D-B4D67D892351 -key HpDmarOptions
-    nvramap.py -mode 2 -efi Setup.efi -nvram NVRAM.bin -guid <GUID> -key <KeyName> --modify
+    nvramap.py -mode 2 -efi Setup.efi -firmware firmware.bin -guid FB3B9ECE-4ABA-4933-B49D-B4D67D892351 -key HpDmarOptions --modify
 """
     ap = argparse.ArgumentParser(
         prog="nvramap.py",
@@ -1047,8 +1109,10 @@ EXAMPLE USAGE:\n
                     help="Operation mode: 1 = EFI→NVRAM  |  2 = NVRAM→EFI")
     req.add_argument("-efi",  required=True, metavar="FILE",
                     help="Path to EFI module containing HII form data")
-    req.add_argument("-nvram", required=True, metavar="FILE",
+    req.add_argument("-nvram", default=None, metavar="FILE",
                     help="Path to raw NVRAM binary blob")
+    req.add_argument("-firmware", default=None, metavar="FILE",
+                    help="Path to full firmware dump (NVRAM store located automatically)")
 
     m1 = ap.add_argument_group("mode 1 options")
     m1.add_argument("-terms", "-t", default=None, metavar="TERMS",
@@ -1083,22 +1147,47 @@ EXAMPLE USAGE:\n
 
     print(BANNER)
 
+    if not args.nvram and not args.firmware:
+        ap.error("one of -nvram or -firmware is required")
+    if args.nvram and args.firmware:
+        ap.error("-nvram and -firmware are mutually exclusive")
+
     # Mode specific args
     if args.mode == "1" and not args.terms and not getattr(args, 'all', False):
         ap.error("Mode 1 requires either -terms KEYWORD or -all")
     if args.mode == "2" and (not args.guid or not args.key):
         ap.error("Mode 2 requires both -guid and -key")
 
-    for path, label in [(args.efi, "-efi"), (args.nvram, "-nvram")]:
-        if not os.path.isfile(path):
-            sys.exit(f"{C_ERR}[!] File not found: {label} {path}{C_RST}")
+    if not os.path.isfile(args.efi):
+        sys.exit(f"{C_ERR}[!] File not found: -efi {args.efi}{C_RST}")
+
+    fw_bytes    = None
+    nvram_off   = 0
+    nvram_size  = 0
+
+    if args.firmware:
+        if not os.path.isfile(args.firmware):
+            sys.exit(f"{C_ERR}[!] File not found: -firmware {args.firmware}{C_RST}")
+        fw_bytes = bytearray(Path(args.firmware).read_bytes())
+        stores_found = _find_all_nvram_stores(bytes(fw_bytes))
+        if not stores_found:
+            sys.exit(f"{C_ERR}[!] NVRAM variable store not found in firmware image{C_RST}")
+        nvram_regions = [(off, size) for off, size in stores_found]
+        nvram_bytes = [bytes(fw_bytes[off:off+size]) for off, size in nvram_regions]
+        print(f"[+] Firmware: {len(fw_bytes):,} bytes")
+        print(f"[+] Found {len(nvram_regions)} NVRAM store(s):")
+        for off, size in nvram_regions:
+            print(f"    0x{off:X}  size=0x{size:X}")
+    else:
+        if not os.path.isfile(args.nvram):
+            sys.exit(f"{C_ERR}[!] File not found: -nvram {args.nvram}{C_RST}")
+        nvram_bytes = Path(args.nvram).read_bytes()
+        nvram_regions = None
+        print(f"[+] NVRAM: {len(nvram_bytes):,} bytes")
 
     # Load IFR
     ifr_text, stores = _load_ifr_and_stores(args.efi, args.extra_efi, args.dump_ifr)
 
-    # Load NVRAM
-    nvram_bytes = Path(args.nvram).read_bytes()
-    print(f"[+] NVRAM: {len(nvram_bytes):,} bytes")
     print("[+] Performing analysis...\n")
 
     # dump var
@@ -1146,8 +1235,7 @@ EXAMPLE USAGE:\n
             return int(raw_val, 16)
         return int(raw_val)
 
-    def _apply_change(idx: int, new_val: int, patched: bytearray) -> bool:
-        """Write new_val into patched buffer at the correct offset for settings[idx]."""
+    def _apply_change(idx: int, new_val: int, patched) -> bool:
         s  = settings[idx]
         vs = stores.get(s.var_store_id)
         if not vs:
@@ -1155,35 +1243,59 @@ EXAMPLE USAGE:\n
             return False
         target = _guid_str_to_bytes(vs.guid)
         size_bytes = max(1, s.size // 8)
-        n = len(patched)
-        search_pos = 0
-        while search_pos < n - 16:
-            guid_pos = bytes(patched).find(target, search_pos)
-            if guid_pos < 0:
-                break
-            search_pos = guid_pos + 1
-            pos = guid_pos + 16
-            name_chars = []
-            while pos + 1 < n:
-                lo, hi = patched[pos], patched[pos+1]; pos += 2
-                if lo == 0 and hi == 0: break
-                name_chars.append(chr(lo) if hi == 0 else "?")
-            if "".join(name_chars) != vs.name:
-                continue
-            write_off = pos + s.var_offset
-            if write_off + size_bytes > n:
-                print(f"  {C_ERR}Offset out of bounds.{C_RST}")
-                return False
-            fmt_s = {1:"B", 2:"<H", 4:"<I", 8:"<Q"}.get(size_bytes, "B")
-            packed = struct.pack(fmt_s, new_val)
-            patched[write_off: write_off + size_bytes] = packed
-            s.current_value = new_val
-            return True
+
+        regions = patched if isinstance(patched, list) else [patched]
+
+        for region in regions:
+            n = len(region)
+            live_off    = None
+            deleted_off = None
+            search_pos  = 0
+
+            while search_pos < n - 16:
+                guid_pos = bytes(region).find(target, search_pos)
+                if guid_pos < 0:
+                    break
+                search_pos = guid_pos + 1
+
+                hdr, name_start = _probe_var_header(bytes(region), guid_pos)
+                if hdr is None:
+                    continue
+                state = region[hdr + 2]
+
+                pos = name_start
+                name_chars = []
+                while pos + 1 < n:
+                    lo, hi = region[pos], region[pos + 1]; pos += 2
+                    if lo == 0 and hi == 0: break
+                    name_chars.append(chr(lo) if hi == 0 else "?")
+                if "".join(name_chars) != vs.name:
+                    continue
+
+                write_off = pos + s.var_offset
+                if write_off + size_bytes > n:
+                    continue
+
+                if state == 0x3F:
+                    live_off = write_off
+                elif deleted_off is None:
+                    deleted_off = write_off
+
+            target_off = live_off if live_off is not None else deleted_off
+            if target_off is not None:
+                fmt_s = {1: "B", 2: "<H", 4: "<I", 8: "<Q"}.get(size_bytes, "B")
+                region[target_off: target_off + size_bytes] = struct.pack(fmt_s, new_val)
+                s.current_value = new_val
+                return True
+
         print(f"  {C_ERR}Variable not found in NVRAM buffer.{C_RST}")
         return False
 
     # Work on an in-memory buffer; only write file at the end
-    patched = bytearray(nvram_bytes)
+    if isinstance(nvram_bytes, list):
+        patched = [bytearray(r) for r in nvram_bytes]
+    else:
+        patched = bytearray(nvram_bytes)
     changes: List[str] = []
 
     if set_arg:
@@ -1242,12 +1354,19 @@ EXAMPLE USAGE:\n
                 changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}")
                 print(f"  {C_OK}New Value: {_fmt_value(new_val, s.size)}{C_RST}\n")
 
-    # Save patched nvram file
+    # Save patched file
     if changes:
-        nvram_p   = Path(args.nvram)
-        out_path  = nvram_p.parent / (nvram_p.stem + "_patched" + nvram_p.suffix)
-        out_path.write_bytes(bytes(patched))
-        print(f"\n{C_OK}  Saved patched NVRAM → {out_path}{C_RST}")
+        src_p    = Path(args.firmware if args.firmware else args.nvram)
+        out_path = src_p.parent / (src_p.stem + "_patched" + src_p.suffix)
+
+        if args.firmware:
+            for (off, size), region in zip(nvram_regions, patched):
+                fw_bytes[off:off + size] = region
+            out_path.write_bytes(bytes(fw_bytes))
+        else:
+            out_path.write_bytes(bytes(patched))
+
+        print(f"\n{C_OK}  Saved → {out_path}{C_RST}")
         print(f"  Changes applied:")
         for c in changes:
             print(f"    {c}")
