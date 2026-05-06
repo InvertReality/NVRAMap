@@ -4,9 +4,9 @@ There are two analysis modes:
 - Mode 1 : Map EFI program settings to NVRAM variables and values
 - Mode 2 : Map NVRAM variable to EFI program settings
   
-The tool is vendor agnostic and works against most modern UEFI implementations. The intended usage is to allow the user to quickly find and modify values related to important security settings when conducting physical penetration tests against UEFI firmware dumps. Once a setting is mapped, it's value can be overwritten and the resultant patched NVRAM can be flashed back onto the target computer's EEPROM chip to control firmware behaviour without requiring access to the pre-boot GUI or triggering a BitLocker recovery. Inspired by [research](https://www.mdsec.co.uk/2026/03/disabling-security-features-in-a-locked-bios/) published by [Craig Blackie](https://github.com/craigsblackie), this tool extracts IFR data from the target EFI module, parses it for relevant settings, then resolves each setting's VarStoreId to it's corresponding NVRAM GUID and Key name, before parsing the provided NVRAM file to extract and display the values at the correct offsets. This technique enables fast analysis of EFI modules or NVRAM Variable Stores. 
+The tool is vendor agnostic and works against most modern UEFI implementations. The intended usage is to allow the user to quickly find and modify values related to important security settings when conducting physical penetration tests against UEFI firmware dumps. Once a setting is mapped, it's value can be overwritten and the resultant patched NVRAM can be flashed back onto the target computer's EEPROM chip to control firmware behaviour without requiring access to the pre-boot GUI or triggering a BitLocker recovery. Inspired by [research](https://www.mdsec.co.uk/2026/03/disabling-security-features-in-a-locked-bios/) published by [Craig Blackie](https://github.com/craigsblackie), this tool extracts IFR data from the target EFI module, parses it for relevant settings, then resolves each setting's VarStoreId to it's corresponding NVRAM GUID and Key name, before parsing the provided NVRAM or firmware dump to extract and display the values at the correct offsets. This technique enables fast analysis of EFI modules or NVRAM Variable Stores. 
 
-To use this tool, extract the firmware from target EEPROM chip. Using UEFITool, select "Extract Body" option to extract the raw NVRAM from your dump, and the efi program you are interested in. Pass both extracted files to NVRAMap and choose one of the two analysis modes to begin automatic relationship discovery.
+To use this tool, extract the firmware from target EEPROM chip. Using UEFITool, select "Extract Body" option to isolate the efi program you are interested in analyzing. Pass the EFI program and either the extracted NVRAM or full firmware dump to NVRAMap and choose one of the two analysis modes to begin automatic relationship discovery.
 
 # Demo (mode 1 - EFI Settings to NVRAM analysis)
 ![](https://github.com/PN-Tester/NVRAMap/blob/main/EFI%20to%20NVRAM.PNG)
@@ -18,7 +18,8 @@ To use this tool, extract the firmware from target EEPROM chip. Using UEFITool, 
 
 # Usage
 ```
-usage: nvramap.py [-h] -mode MODE -efi FILE -nvram FILE [-terms TERMS] [-all] [-guid GUID] [-key NAME] [--modify] [--set INDEX VALUE] [--extra-efi FILE [FILE ...]] [--dump-ifr FILE] [--dump-var GUID] [--debug]
+usage: nvramap.py [-h] -mode MODE -efi FILE [-nvram FILE] [-firmware FILE] [-terms TERMS] [-all] [-guid GUID] [-key NAME] [--modify]
+                  [--set INDEX VALUE] [--extra-efi FILE [FILE ...]] [--dump-ifr FILE] [--dump-var GUID] [--debug]
 
 NVRAMap — UEFI NVRAM Mapper & Editor
 
@@ -36,6 +37,7 @@ required arguments:
   -mode MODE            Operation mode: 1 = EFI→NVRAM | 2 = NVRAM→EFI
   -efi FILE             Path to EFI module containing HII form data
   -nvram FILE           Path to raw NVRAM binary blob
+  -firmware FILE        Path to full firmware dump (NVRAM stores are located automatically)
 
 mode 1 options:
   -terms TERMS, -t TERMS
@@ -58,13 +60,14 @@ options:
 EXAMPLE USAGE:
 
   Mode 1 — Map EFI settings to NVRAM variables (search by keyword):
+    nvramap.py -mode 1 -efi Setup.efi -firmware firmware.bin -terms DMA,Intel
     nvramap.py -mode 1 -efi Setup.efi -nvram NVRAM.bin -terms VT-d,IOMMU
-    nvramap.py -mode 1 -efi Setup.efi -nvram NVRAM.bin -terms DMA --modify
-    nvramap.py -mode 1 -efi Setup.efi -nvram NVRAM.bin -terms DMA --set 2 0x1
+    nvramap.py -mode 1 -efi Setup.efi -firmware firmware.bin -terms "DMA,Intel,Virtualization" --modify
 
   Mode 2 — Map NVRAM variables to EFI settings (reverse lookup by GUID + key):
     nvramap.py -mode 2 -efi Setup.efi -nvram NVRAM.bin -guid FB3B9ECE-4ABA-4933-B49D-B4D67D892351 -key HpDmarOptions
-    nvramap.py -mode 2 -efi Setup.efi -nvram NVRAM.bin -guid <GUID> -key <KeyName> --modify
+    nvramap.py -mode 2 -efi Setup.efi -firmware firmware.bin -guid FB3B9ECE-4ABA-4933-B49D-B4D67D892351 -key HpDmarOptions --modify
+
 ```
 
 # Explanation
