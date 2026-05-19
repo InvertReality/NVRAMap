@@ -710,9 +710,13 @@ def _find_all_nvram_stores(fw: bytes) -> List[Tuple[int, int]]:
     """
     Find every EFI variable store in a firmware image.
     Returns list of (offset, size) for all valid candidates.
+
+    To reliably identify the real NVRAM store across all firmware layouts,
+    collect all candidate store regions and return only the largest one. 
+    Avoids issue of patching, for example, FTW (Fault Tollerance Write) area.
     """
     n = len(fw)
-    stores = []
+    store_candidates = []
     i = 0
     while i < n - 28:
         if fw[i + 20] == 0x5A and fw[i + 21] == 0xFE:
@@ -720,9 +724,14 @@ def _find_all_nvram_stores(fw: bytes) -> List[Tuple[int, int]]:
             if 0x400 < size < 0x800000 and i + size <= n:
                 aa55_near = fw.find(b'\xaa\x55', i + 28, i + 92)
                 if aa55_near >= 0:
-                    stores.append((i, size))
+                    store_candidates.append((i, size))
         i += 1
-    return stores
+
+    if not store_candidates:
+        return []
+
+    largest_store = max(store_candidates, key=lambda var_store: var_store[1])
+    return[largest_store]
 
 
 def _guid_str_to_bytes(gs: str) -> bytes:
