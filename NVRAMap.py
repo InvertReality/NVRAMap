@@ -27,13 +27,15 @@ DEBUG = False   # set to True via --debug flag
 try:
     from colorama import Fore, Style, init as _ci
     _ci(autoreset=True)
-    C_HEAD = Fore.CYAN  + Style.BRIGHT
-    C_OK   = Fore.GREEN + Style.BRIGHT
-    C_WARN = Fore.YELLOW
-    C_ERR  = Fore.RED   + Style.BRIGHT
-    C_RST  = Style.RESET_ALL
+    C_HEAD   = Fore.CYAN  + Style.BRIGHT
+    C_OK     = Fore.GREEN + Style.BRIGHT
+    C_WARN   = Fore.YELLOW
+    C_ERR    = Fore.RED   + Style.BRIGHT
+    C_RST    = Style.RESET_ALL
+    C_GREY   = "\033[90m"
+    C_STATUS = Fore.WHITE + Style.BRIGHT
 except ImportError:
-    C_HEAD = C_OK = C_WARN = C_ERR = C_RST = ""
+    C_HEAD = C_OK = C_WARN = C_ERR = C_RST = C_GREY = C_STATUS = ""
 
 
 # data structures
@@ -650,13 +652,44 @@ def parse_oneof_options(ifr_text: str) -> Dict[Tuple[int, int], Dict[int, str]]:
     (duplicate question IDs gated by different SuppressIf conditions), we
     merge all options together — the union of all labels is the most useful
     result for display and validation purposes.
+
+    Multi-line Help strings
+    -----------------------
+    Some IFR decoders emit the Help: value with embedded newlines so that a
+    single logical OneOf header spans several physical lines.  We pre-process
+    the text to collapse those continuations: any physical line whose stripped
+    form does NOT begin with a recognised IFR keyword is treated as a
+    continuation of the previous logical line and joined to it with a space.
+    This makes the header regex work correctly without any changes to it.
     """
+    # ------------------------------------------------------------------ #
+    # Step 1 — collapse continuation lines caused by embedded newlines    #
+    # in quoted string fields (Help:, Prompt:, Option:, etc.)             #
+    #                                                                      #
+    # We track whether we are currently inside an open double-quote so    #
+    # that any physical line break that falls inside a quoted value gets   #
+    # joined back onto the logical line rather than treated as a new one. #
+    # ------------------------------------------------------------------ #
+    logical_lines: List[str] = []
+    in_string = False
+    for raw in ifr_text.splitlines():
+        if in_string:
+            # Still inside a quoted value from a previous physical line —
+            # append to the current logical line (strip leading whitespace
+            # so we don't bloat the joined string, but keep a space separator)
+            logical_lines[-1] = logical_lines[-1].rstrip() + " " + raw.strip()
+        else:
+            logical_lines.append(raw)
+        # Count unescaped double-quotes to track open/close state.
+        # Each '"' toggles the in-string flag (we assume no escaped quotes
+        # in IFR output, which is true for all known decoders).
+        in_string = (raw.count('"') % 2 == 1) != in_string  # XOR toggle
+
     result: Dict[Tuple[int, int], Dict[int, str]] = {}
-    lines = ifr_text.splitlines()
 
     i = 0
-    while i < len(lines):
-        line = lines[i]
+    while i < len(logical_lines):
+        line = logical_lines[i]
         hm = _RE_ONEOF_HEADER.search(line)
         if hm:
             vs_id  = int(hm.group(1), 16)
@@ -666,8 +699,8 @@ def parse_oneof_options(ifr_text: str) -> Dict[Tuple[int, int], Dict[int, str]]:
 
             depth = 1   # the OneOf itself opened a scope
             i += 1
-            while i < len(lines) and depth > 0:
-                l       = lines[i]
+            while i < len(logical_lines) and depth > 0:
+                l        = logical_lines[i]
                 stripped = l.strip()
 
                 # Collect direct-child OneOfOption entries (depth == 1 means
@@ -687,11 +720,6 @@ def parse_oneof_options(ifr_text: str) -> Dict[Tuple[int, int], Dict[int, str]]:
                     stripped.startswith(kw) for kw in _SCOPE_OPENERS
                 ):
                     depth += 1
-                # A nested "OneOf" inside (e.g. wrapped in GrayOutIf) will be
-                # picked up by the outer loop on its own iteration, so we do
-                # NOT increment depth for it here — we just let the outer
-                # while-loop handle it when i reaches that line again.  This
-                # works because we continue advancing i regardless.
 
                 i += 1
 
@@ -1076,20 +1104,26 @@ def print_settings_table(settings: List[HiiSetting], stores: Dict[int, VarStore]
     w  = _col_w(rs, headers)
     fmt = "  ".join(f"{{:<{x}}}" for x in w)
     sep = "  ".join("─" * x for x in w)
-    # ANSI code for dark/dim grey (works on colorama and most terminals)
-    C_GREY = "\033[90m"
     table_lines = [fmt.format(*headers), sep]
     for row in rs:
-        line = fmt.format(*row)
         val    = row[4]
         status = row[5]
+        # Pad to column width first, then wrap in colour so ANSI codes don't
+        # throw off alignment (escape bytes are invisible but count as chars).
+        val_padded    = f"{val:<{w[4]}}"
+        status_padded = f"{status:<{w[5]}}"
         if val == "NOT FOUND":
-            line = line.replace(val, f"{C_WARN}{val}{C_RST}", 1)
+            row[4] = f"{C_WARN}{val_padded}{C_RST}"
         else:
-            line = line.replace(val, f"{C_OK}{val}{C_RST}", 1)
+            row[4] = f"{C_OK}{val_padded}{C_RST}"
         if status == "unknown":
-            line = line.replace(status, f"{C_GREY}{status}{C_RST}", 1)
-        table_lines.append(line)
+            row[5] = f"{C_GREY}{status_padded}{C_RST}"
+        else:
+            row[5] = f"{C_STATUS}{status_padded}{C_RST}"
+        # Pad uncoloured columns to their widths, then append pre-coloured cells
+        parts = [f"{row[j]:<{w[j]}}" for j in range(4)]
+        # Use explicit two-space gap before value; status is last so no trailing needed
+        table_lines.append("  ".join(parts) + "  " + row[4] + "  " + row[5])
     _box(title, table_lines)
     print()
 
@@ -1333,6 +1367,7 @@ EXAMPLE USAGE:\n
             title = f"MODE 1  —  EFI Settings → NVRAM  ({args.terms})"
         if not settings:
             sys.exit(f"{C_WARN}[!] No settings found{C_RST}")
+        settings = [s for s in settings if s.prompt.strip()]
         for s in settings:
             s.var_store = stores.get(s.var_store_id)
 
@@ -1340,6 +1375,7 @@ EXAMPLE USAGE:\n
         settings = reverse_lookup(ifr_text, stores, args.guid, args.key)
         if not settings:
             sys.exit(f"{C_WARN}[!] No settings found for GUID={args.guid}  Key={args.key}{C_RST}")
+        settings = [s for s in settings if s.prompt.strip()]
         title = f"MODE 2  —  NVRAM → EFI Settings  |  {args.key}  ({args.guid})"
 
     for s in settings:
@@ -1437,7 +1473,7 @@ EXAMPLE USAGE:\n
             opts = _resolve_opts(s.widget_type, oneof_options, s.var_store_id, s.var_offset)
             status = decode_value(new_val, opts)
             changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}  ({status})")
-            print(f"  {C_OK}Set [{idx+1}] {s.prompt} = {_fmt_value(new_val, s.size)}  ({status}){C_RST}")
+            print(f"  Set [{idx+1}] {s.prompt} = {C_OK}{_fmt_value(new_val, s.size)}{C_RST}  ({C_STATUS}{status}{C_RST})")
 
     elif do_modify:
         print("  Modify mode — select a setting by number, 'done' to save, 'q' to quit without saving.")
@@ -1470,7 +1506,7 @@ EXAMPLE USAGE:\n
             cur = _fmt_value(s.current_value, s.size)
             opts = _resolve_opts(s.widget_type, oneof_options, s.var_store_id, s.var_offset)
             print(f"\n  [{idx+1}] {s.prompt}")
-            print(f"       Current      : {cur}  ({decode_value(s.current_value, opts)})")
+            print(f"       Current      : {cur}  ({C_STATUS}{decode_value(s.current_value, opts)}{C_RST})")
             print(f"       Valid range  : 0x{s.min_val:X} – 0x{s.max_val:X}")
             if opts:
                 print(f"       Valid options:")
@@ -1488,7 +1524,7 @@ EXAMPLE USAGE:\n
             if _apply_change(idx, new_val, patched):
                 status = decode_value(new_val, opts)
                 changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}  ({status})")
-                print(f"  {C_OK}New Value: {_fmt_value(new_val, s.size)}  ({status}){C_RST}\n")
+                print(f"  New Value: {C_OK}{_fmt_value(new_val, s.size)}{C_RST}  ({C_STATUS}{status}{C_RST})\n")
 
     # Save patched file
     if changes:
