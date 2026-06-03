@@ -18,7 +18,7 @@ To use this tool, extract the firmware from target EEPROM chip. Using UEFITool, 
 
 # Demo (Modifying values)
 ![](https://github.com/PN-Tester/NVRAMap/blob/main/ModeModify.PNG)
-*The above image shows modification of pre-boot DMA Protection setting from ON to OFF*
+*The above image shows modification of pre-boot DMA Protection setting*
 
 # Usage
 ```
