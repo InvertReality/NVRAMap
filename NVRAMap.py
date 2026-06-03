@@ -423,7 +423,7 @@ def parse_form_package(data: bytes, pkg_offset: int, pkg_len: int,
                     f'Flags: 0x{opdata[11]:X}, Size: {sz}, '
                     f'Min: 0x{mn:X}, Max: 0x{mx:X}, Step: 0x{st:X}')
 
-        elif op == IFR_OP_ONE_OF_OPT and len(opdata) >= 7:
+        elif op == IFR_OP_ONE_OF_OPT and len(opdata) >= 5:
             ostr   = S(u16(opdata, 0))
             oflags = opdata[2]
             val_hex = opdata[4:12].hex().upper()
@@ -599,6 +599,139 @@ def parse_varstores(ifr_text: str) -> Dict[int, VarStore]:
         stores[vsid] = VarStore(guid=guid, var_store_id=vsid,
                                 attributes=attrs, size=size, name=name)
     return stores
+
+
+_RE_ONEOF_HEADER = re.compile(
+    r'OneOf\s+Prompt:\s*"[^"]*"'
+    r'.*?VarStoreId:\s*0x([0-9A-Fa-f]+)'
+    r'.*?VarOffset:\s*0x([0-9A-Fa-f]+)',
+    re.IGNORECASE,
+)
+
+_RE_ONEOF_OPTION = re.compile(
+    r'OneOfOption\s+Option:\s*"([^"]*)"'
+    r',\s*Value:\s*0x([0-9A-Fa-f]+)',
+    re.IGNORECASE,
+)
+
+# Opcodes that open a new scope (used for depth tracking inside OneOf blocks).
+# NOTE: "OneOf" must NOT appear here — it is the block we are already inside,
+# and "OneOfOption" must never match as a scope-opener.
+_SCOPE_OPENERS = (
+    "CheckBox ", "Numeric ", "Action ", "Ref ",
+    "GrayOutIf", "SuppressIf", "DisableIf", "InconsistentIf",
+    "NoSubmitIf", "Form ", "FormSet", "OrderedList",
+    "Date ", "Time ", "String ",
+)
+
+
+def parse_oneof_options(ifr_text: str) -> Dict[Tuple[int, int], Dict[int, str]]:
+    """
+    Build a mapping of (var_store_id, var_offset) -> {value: label}
+    by scanning every OneOf block and its direct OneOfOption children.
+
+    Strategy
+    --------
+    We scan line-by-line. When we find a OneOf header we record its key
+    (VarStoreId, VarOffset), then walk forward counting scope depth:
+      - depth starts at 1 (the OneOf itself opened a scope)
+      - any scope-opening opcode found inside increments depth
+      - "End" decrements depth
+      - OneOfOption lines are collected ONLY when depth == 1
+        (i.e. they are direct children of the OneOf, not of a nested block)
+
+    The key pitfall avoided: "OneOfOption" starts with "OneOf" so we must
+    check for the full token "OneOfOption" before checking scope openers,
+    and "OneOf " (with trailing space) must never appear in _SCOPE_OPENERS
+    so that nested OneOf widgets inside a GrayOutIf etc. are handled correctly
+    by the outer recursive search rather than by double-counting here.
+
+    When the same (VarStoreId, VarOffset) appears in multiple OneOf blocks
+    (duplicate question IDs gated by different SuppressIf conditions), we
+    merge all options together — the union of all labels is the most useful
+    result for display and validation purposes.
+    """
+    result: Dict[Tuple[int, int], Dict[int, str]] = {}
+    lines = ifr_text.splitlines()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        hm = _RE_ONEOF_HEADER.search(line)
+        if hm:
+            vs_id  = int(hm.group(1), 16)
+            vs_off = int(hm.group(2), 16)
+            key    = (vs_id, vs_off)
+            opts: Dict[int, str] = {}
+
+            depth = 1   # the OneOf itself opened a scope
+            i += 1
+            while i < len(lines) and depth > 0:
+                l       = lines[i]
+                stripped = l.strip()
+
+                # Collect direct-child OneOfOption entries (depth == 1 means
+                # we are still inside the OneOf but not inside any nested block)
+                if depth == 1:
+                    om = _RE_ONEOF_OPTION.search(l)
+                    if om:
+                        val = int(om.group(2), 16)
+                        opts[val] = om.group(1)
+
+                # Scope accounting — check End first, then openers.
+                # "OneOfOption" does NOT open a scope; skip it explicitly so
+                # that the startswith("OneOf") check below cannot fire on it.
+                if stripped.startswith("End"):
+                    depth -= 1
+                elif not stripped.startswith("OneOfOption") and any(
+                    stripped.startswith(kw) for kw in _SCOPE_OPENERS
+                ):
+                    depth += 1
+                # A nested "OneOf" inside (e.g. wrapped in GrayOutIf) will be
+                # picked up by the outer loop on its own iteration, so we do
+                # NOT increment depth for it here — we just let the outer
+                # while-loop handle it when i reaches that line again.  This
+                # works because we continue advancing i regardless.
+
+                i += 1
+
+            # Merge into result (union of options from duplicate blocks)
+            if opts:
+                if key in result:
+                    result[key].update(opts)
+                else:
+                    result[key] = opts
+            continue
+        i += 1
+
+    return result
+
+
+_CHECKBOX_OPTIONS: Dict[int, str] = {0: "Disabled", 1: "Enabled"}
+
+
+def _resolve_opts(widget_type: str,
+                  oneof_options: Optional[Dict[Tuple[int, int], Dict[int, str]]],
+                  var_store_id: int, var_offset: int) -> Optional[Dict[int, str]]:
+    """
+    Return the options dict for a setting, synthesising {0: Disabled, 1: Enabled}
+    for CheckBox widgets so every call site treats all widget types uniformly.
+    """
+    if widget_type.lower() == "checkbox":
+        return _CHECKBOX_OPTIONS
+    if oneof_options:
+        return oneof_options.get((var_store_id, var_offset))
+    return None
+
+
+def decode_value(val: Optional[int], options: Optional[Dict[int, str]],
+                 widget_type: str = "") -> str:
+    """Return the human-readable label for a value, or 'unknown' if not found."""
+    if val is None:
+        return "unknown"
+    if options:
+        return options.get(val, "unknown")
+    return "unknown"
 
 
 def grep_settings(ifr_text: str, terms: List[str]) -> List[HiiSetting]:
@@ -926,28 +1059,36 @@ def _fmt_value(val: Optional[int], size_bits: int) -> str:
 
 
 def print_settings_table(settings: List[HiiSetting], stores: Dict[int, VarStore],
-                          title: str = "SETTINGS") -> None:
+                          title: str = "SETTINGS",
+                          oneof_options: Optional[Dict[Tuple[int, int], Dict[int, str]]] = None) -> None:
     rows = []
     for i, s in enumerate(settings):
         vs = stores.get(s.var_store_id)
         store_name = vs.name if vs else f"0x{s.var_store_id:X}"
         setting_name = s.prompt if len(s.prompt) <= 44 else s.prompt[:43] + "\u2026"
         val_str = _fmt_value(s.current_value, s.size)
+        opts = _resolve_opts(s.widget_type, oneof_options, s.var_store_id, s.var_offset)
+        decoded = decode_value(s.current_value, opts)
         rows.append([str(i + 1), setting_name, store_name,
-                     f"0x{s.var_offset:X}", val_str])
-    headers = ["#", "Setting", "Store", "Offset", "Value"]
+                     f"0x{s.var_offset:X}", val_str, decoded])
+    headers = ["#", "Setting", "Store", "Offset", "Value", "Status"]
     rs = [[str(c) for c in row] for row in rows]
     w  = _col_w(rs, headers)
     fmt = "  ".join(f"{{:<{x}}}" for x in w)
     sep = "  ".join("─" * x for x in w)
+    # ANSI code for dark/dim grey (works on colorama and most terminals)
+    C_GREY = "\033[90m"
     table_lines = [fmt.format(*headers), sep]
     for row in rs:
         line = fmt.format(*row)
-        val = row[4]
+        val    = row[4]
+        status = row[5]
         if val == "NOT FOUND":
             line = line.replace(val, f"{C_WARN}{val}{C_RST}", 1)
         else:
             line = line.replace(val, f"{C_OK}{val}{C_RST}", 1)
+        if status == "unknown":
+            line = line.replace(status, f"{C_GREY}{status}{C_RST}", 1)
         table_lines.append(line)
     _box(title, table_lines)
     print()
@@ -1024,7 +1165,12 @@ def _load_ifr_and_stores(efi: str, extra_efi: List[str], dump_ifr: Optional[str]
             if DEBUG and len(stores) > before:
                 print(f"[+] Merged {len(stores)-before} additional VarStore(s) from siblings.")
 
-    return ifr_text, stores
+    oneof_options = parse_oneof_options(ifr_text)
+    if DEBUG:
+        total_opts = sum(len(v) for v in oneof_options.values())
+        print(f"[+] Parsed {len(oneof_options)} OneOf setting(s) with {total_opts} total option(s).")
+
+    return ifr_text, stores, oneof_options
 
 
 def main() -> None:
@@ -1170,7 +1316,7 @@ EXAMPLE USAGE:\n
             print(f"[+] NVRAM: {len(raw_nvram):,} bytes")
 
     # Load IFR
-    ifr_text, stores = _load_ifr_and_stores(args.efi, args.extra_efi, args.dump_ifr)
+    ifr_text, stores, oneof_options = _load_ifr_and_stores(args.efi, args.extra_efi, args.dump_ifr)
 
     print("[+] Performing analysis...\n")
 
@@ -1203,7 +1349,7 @@ EXAMPLE USAGE:\n
                 nvram_bytes, vs.guid, s.var_offset, s.size, var_name=vs.name)
 
     print_varstore_map(settings, stores)
-    print_settings_table(settings, stores, title=title)
+    print_settings_table(settings, stores, title=title, oneof_options=oneof_options)
 
 
     # Modification logic
@@ -1287,15 +1433,20 @@ EXAMPLE USAGE:\n
         if not (0 <= idx < len(settings)):
             sys.exit(f"{C_ERR}Index {idx+1} out of range (1–{len(settings)}).{C_RST}")
         if _apply_change(idx, new_val, patched):
-            s = settings[idx]
-            changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}")
-            print(f"  {C_OK}Set [{idx+1}] {s.prompt} = {_fmt_value(new_val, s.size)}{C_RST}")
+            s    = settings[idx]
+            opts = _resolve_opts(s.widget_type, oneof_options, s.var_store_id, s.var_offset)
+            status = decode_value(new_val, opts)
+            changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}  ({status})")
+            print(f"  {C_OK}Set [{idx+1}] {s.prompt} = {_fmt_value(new_val, s.size)}  ({status}){C_RST}")
 
     elif do_modify:
         print("  Modify mode — select a setting by number, 'done' to save, 'q' to quit without saving.")
         print()
+        first_iteration = True
         while True:
-            print_settings_table(settings, stores, title="Current Values")
+            if not first_iteration:
+                print_settings_table(settings, stores, title="Current Values", oneof_options=oneof_options)
+            first_iteration = False
             try:
                 raw = input("  >> ").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1317,9 +1468,14 @@ EXAMPLE USAGE:\n
             s  = settings[idx]
             vs = stores.get(s.var_store_id)
             cur = _fmt_value(s.current_value, s.size)
+            opts = _resolve_opts(s.widget_type, oneof_options, s.var_store_id, s.var_offset)
             print(f"\n  [{idx+1}] {s.prompt}")
-            print(f"       Current : {cur}")
-            print(f"       Range   : 0x{s.min_val:X} – 0x{s.max_val:X}")
+            print(f"       Current      : {cur}  ({decode_value(s.current_value, opts)})")
+            print(f"       Valid range  : 0x{s.min_val:X} – 0x{s.max_val:X}")
+            if opts:
+                print(f"       Valid options:")
+                for opt_val, opt_label in sorted(opts.items()):
+                    print(f"         {C_OK}0x{opt_val:02X}{C_RST}  →  {opt_label}")
             try:
                 raw_val = input("  New value (hex 0x.. or decimal, blank to skip): ").strip()
                 if not raw_val:
@@ -1330,8 +1486,9 @@ EXAMPLE USAGE:\n
             if not (s.min_val <= new_val <= s.max_val):
                 print(f"  {C_WARN}Warning: outside valid range.{C_RST}")
             if _apply_change(idx, new_val, patched):
-                changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}")
-                print(f"  {C_OK}New Value: {_fmt_value(new_val, s.size)}{C_RST}\n")
+                status = decode_value(new_val, opts)
+                changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}  ({status})")
+                print(f"  {C_OK}New Value: {_fmt_value(new_val, s.size)}  ({status}){C_RST}\n")
 
     # Save patched file
     if changes:
