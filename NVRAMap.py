@@ -7,6 +7,7 @@ import os
 import re
 import struct
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -152,13 +153,24 @@ def _is_valid_string_pkg_hdr(payload: bytes) -> bool:
     return False
 
 
-def parse_string_package(data: bytes, pkg_offset: int, pkg_len: int) -> Optional[Dict[int, str]]:
+def _read_pkg_language(payload: bytes) -> str:
+    """Extract the null-terminated ASCII language tag from offset 42 of the string package header."""
+    end = payload.find(0, 42)
+    if end < 0:
+        return ""
+    return payload[42:end].decode("ascii", errors="replace").lower()
+
+
+def parse_string_package(data: bytes, pkg_offset: int, pkg_len: int) -> Optional[Tuple[Dict[int, str], str]]:
+    """Returns (string_map, language_tag) or None."""
     if pkg_offset + pkg_len > len(data):
         return None
     payload = data[pkg_offset + 4: pkg_offset + pkg_len]
 
     if not _is_valid_string_pkg_hdr(payload):
         return None
+
+    language = _read_pkg_language(payload)
 
     sibt_start = _find_sibt_start(payload)
     if sibt_start < 0:
@@ -241,7 +253,7 @@ def parse_string_package(data: bytes, pkg_offset: int, pkg_len: int) -> Optional
         else:
             break
 
-    return string_map if len(string_map) > 1 else None
+    return (string_map, language) if len(string_map) > 1 else None
 
 
 
@@ -428,10 +440,14 @@ def parse_form_package(data: bytes, pkg_offset: int, pkg_len: int,
         elif op == IFR_OP_ONE_OF_OPT and len(opdata) >= 5:
             ostr   = S(u16(opdata, 0))
             oflags = opdata[2]
-            val_hex = opdata[4:12].hex().upper()
+            vtype  = opdata[3]
+            _vsize_map = {0: 1, 1: 1, 2: 2, 3: 4, 4: 8}
+            _vfmt_map  = {1: "B", 2: "<H", 4: "<I", 8: "<Q"}
+            vsize  = _vsize_map.get(vtype, 1)
+            raw_val = struct.unpack_from(_vfmt_map[vsize], opdata, 4)[0] if len(opdata) >= 4 + vsize else 0
             dflt   = ", Default"    if (oflags & 0x10) else ""
             mfgd   = ", MfgDefault" if (oflags & 0x20) else ""
-            line = f'{indent}OneOfOption Option: "{ostr}", Value: 0x{val_hex}{dflt}{mfgd}'
+            line = f'{indent}OneOfOption Option: "{ostr}", Value: 0x{raw_val:X}{dflt}{mfgd}'
 
         elif op == IFR_OP_DEFAULTSTORE and len(opdata) >= 4:
             nstr  = S(u16(opdata, 0))
@@ -503,9 +519,9 @@ PKG_TYPE_FORMS  = 0x02
 PKG_TYPE_STRING = 0x04
 
 
-def find_packages(data: bytes) -> Tuple[List[Tuple[int,int,Dict[int,str]]], List[Tuple[int,int]]]:
-    string_pkgs: List[Tuple[int,int,Dict[int,str]]] = []
-    form_pkgs:   List[Tuple[int,int]]               = []
+def find_packages(data: bytes) -> Tuple[List[Tuple[int,int,Dict[int,str],str]], List[Tuple[int,int]]]:
+    string_pkgs: List[Tuple[int,int,Dict[int,str],str]] = []
+    form_pkgs:   List[Tuple[int,int]]                   = []
     n = len(data)
     i = 0
     while i < n - 4:
@@ -515,9 +531,10 @@ def find_packages(data: bytes) -> Tuple[List[Tuple[int,int,Dict[int,str]]], List
 
         if plen >= 4 and i + plen <= n:
             if ptype == PKG_TYPE_STRING and plen >= 50:
-                smap = parse_string_package(data, i, plen)
-                if smap is not None:
-                    string_pkgs.append((i, plen, smap))
+                result = parse_string_package(data, i, plen)
+                if result is not None:
+                    smap, lang = result
+                    string_pkgs.append((i, plen, smap, lang))
                     i += plen
                     continue
 
@@ -548,7 +565,10 @@ def extract_ifr(efi_path: str) -> str:
 
     best_strings: Dict[int, str] = {}
     if string_pkgs:
-        best_strings = max(string_pkgs, key=lambda x: len(x[2]))[2]
+        # Prefer English language packages; fall back to largest by string count.
+        en_pkgs = [p for p in string_pkgs if p[3].startswith("en")]
+        candidates = en_pkgs if en_pkgs else string_pkgs
+        best_strings = max(candidates, key=lambda x: len(x[2]))[2]
         print(f"[+] Using string package with {len(best_strings)} strings")
 
     all_lines: List[str] = []
@@ -617,13 +637,16 @@ _RE_ONEOF_OPTION = re.compile(
 )
 
 # Opcodes that open a new scope (used for depth tracking inside OneOf blocks).
-# NOTE: "OneOf" must NOT appear here — it is the block we are already inside,
-# and "OneOfOption" must never match as a scope-opener.
+# "OneOf " IS included here so that a second OneOf encountered while already
+# scanning inside a OneOf block (e.g. a sibling OneOf nested inside a wrapping
+# SuppressIf/GrayOutIf) is counted as a nested scope opener and its matching
+# End does not prematurely close the outer OneOf's depth counter.
+# "OneOfOption" must never match as a scope-opener.
 _SCOPE_OPENERS = (
     "CheckBox ", "Numeric ", "Action ", "Ref ",
     "GrayOutIf", "SuppressIf", "DisableIf", "InconsistentIf",
     "NoSubmitIf", "Form ", "FormSet", "OrderedList",
-    "Date ", "Time ", "String ",
+    "Date ", "Time ", "String ", "OneOf ",
 )
 
 
@@ -1010,8 +1033,23 @@ def reverse_lookup(ifr_text: str, stores: Dict[int, VarStore],
     }
     if not matching_vsids:
         return []
+    # Map from vs_off -> index in results, for duplicate resolution.
+    # The same physical NVRAM offset can appear in multiple FormSets under
+    # different VarStoreId values (e.g. the AMD CBS FormSet uses VarStoreId
+    # 0x5000 while the Lenovo wrapper FormSet uses VarStoreId 0x2 for the
+    # same underlying GUID+offset). We deduplicate by var_offset alone and
+    # keep whichever entry has the more readable prompt: prefer entries where
+    # prompt != help_text (shadow/proxy questions in wrapper FormSets reuse
+    # the real help string as their prompt, making them identical).
     results: List[HiiSetting] = []
-    seen: Set[Tuple] = set()
+    off_to_idx: Dict[int, int] = {}
+
+    def _prompt_quality(prompt: str, help_text: str) -> int:
+        """Higher is better. Penalise prompts that equal their own help text."""
+        if prompt == help_text:
+            return 0
+        return 1
+
     for m in _RE_SETTING.finditer(ifr_text):
         widget    = m.group(1)
         prompt    = m.group(2)
@@ -1027,16 +1065,18 @@ def reverse_lookup(ifr_text: str, stores: Dict[int, VarStore],
         step      = int(m.group(12), 16)  if m.group(12) else 0
         if vs_id not in matching_vsids:
             continue
-        key = (vs_id, vs_off)
-        if key in seen:
-            continue
-        seen.add(key)
         s = HiiSetting(widget_type=widget, prompt=prompt, help_text=help_text,
                        question_flags=q_flags, question_id=q_id,
                        var_store_id=vs_id, var_offset=vs_off,
                        flags=flags, size=size, min_val=min_v, max_val=max_v, step=step)
         s.var_store = stores.get(vs_id)
-        results.append(s)
+        if vs_off in off_to_idx:
+            existing = results[off_to_idx[vs_off]]
+            if _prompt_quality(prompt, help_text) > _prompt_quality(existing.prompt, existing.help_text):
+                results[off_to_idx[vs_off]] = s
+        else:
+            off_to_idx[vs_off] = len(results)
+            results.append(s)
     return results
 
 
@@ -1064,6 +1104,22 @@ def _box(title: str, lines: List[str]) -> None:
         pad = width - len(l) - 2
         print(f"  {l}")
     print(f"{C_HEAD}└{bar}┘{C_RST}")
+
+def _mini_box(title: str, lines: List[str], width: int = 60, indent: str = "   ") -> None:
+    """Print a small box in the same cyan/white style as _box, with fixed width."""
+    inner = width - 2  # space between the two vertical bars
+    bar   = "─" * width
+    print(f"\n{indent}{C_HEAD}┌{bar}┐")
+    pad = inner - len(title) - 1
+    print(f"{indent}│ {title}{' ' * max(pad, 0)}  │")
+    print(f"{indent}├{bar}┤{C_RST}")
+    for l in lines:
+        # Strip ANSI codes for length measurement so padding aligns correctly.
+        visible = re.sub(r'\x1b\[[0-9;]*m', '', l)
+        pad = inner - len(visible) - 1
+        print(f"{indent}  {l}{' ' * max(pad, 0)}")
+    print(f"{indent}{C_HEAD}└{bar}┘{C_RST}")
+
 
 def print_table(headers: List[str], rows: List[List], title: str = "") -> None:
     rs  = [[str(c) for c in row] for row in rows]
@@ -1093,7 +1149,11 @@ def print_settings_table(settings: List[HiiSetting], stores: Dict[int, VarStore]
     for i, s in enumerate(settings):
         vs = stores.get(s.var_store_id)
         store_name = vs.name if vs else f"0x{s.var_store_id:X}"
-        setting_name = s.prompt if len(s.prompt) <= 44 else s.prompt[:43] + "\u2026"
+        # AMD wrapper FormSets sometimes encode the short display name in the
+        # Help field and the long description in the Prompt field (swapped).
+        # Use whichever is shorter as the display name.
+        display = s.prompt if (not s.help_text or len(s.prompt) <= len(s.help_text)) else s.help_text
+        setting_name = display if len(display) <= 44 else display[:43] + "\u2026"
         val_str = _fmt_value(s.current_value, s.size)
         opts = _resolve_opts(s.widget_type, oneof_options, s.var_store_id, s.var_offset)
         decoded = decode_value(s.current_value, opts)
@@ -1505,15 +1565,34 @@ EXAMPLE USAGE:\n
             vs = stores.get(s.var_store_id)
             cur = _fmt_value(s.current_value, s.size)
             opts = _resolve_opts(s.widget_type, oneof_options, s.var_store_id, s.var_offset)
-            print(f"\n  [{idx+1}] {s.prompt}")
-            print(f"       Current      : {cur}  ({C_STATUS}{decode_value(s.current_value, opts)}{C_RST})")
-            print(f"       Valid range  : 0x{s.min_val:X} – 0x{s.max_val:X}")
+
+            # Determine display name (same logic as the table)
+            display = s.prompt if (not s.help_text or len(s.prompt) <= len(s.help_text)) else s.help_text
+            help_to_show = s.help_text if (not s.help_text or len(s.prompt) <= len(s.help_text)) else s.prompt
+
+            # ── Info box ────────────────────────────────────────────────────
+            info_lines = [
+                f"Current  : {C_OK}{cur}{C_RST}  ({C_STATUS}{decode_value(s.current_value, opts)}{C_RST})",
+                f"Range    : 0x{s.min_val:X} – 0x{s.max_val:X}",
+            ]
+            _mini_box(f"[{idx+1}] {display}", info_lines)
+
+            # ── Help box ─────────────────────────────────────────────────────
+            if help_to_show:
+                wrapped = textwrap.wrap(help_to_show, width=56) or [help_to_show]
+                _mini_box("Help", wrapped)
+
+            # ── Options box ──────────────────────────────────────────────────
             if opts:
-                print(f"       Valid options:")
-                for opt_val, opt_label in sorted(opts.items()):
-                    print(f"         {C_OK}0x{opt_val:02X}{C_RST}  →  {opt_label}")
+                opt_lines = [
+                    f"{C_OK}0x{ov:02X}{C_RST}  →  {ol}"
+                    for ov, ol in sorted(opts.items())
+                ]
+                _mini_box("Valid Options", opt_lines)
+
+            print()
             try:
-                raw_val = input("  New value (hex 0x.. or decimal, blank to skip): ").strip()
+                raw_val = input("  Enter New Value - Hex or Decimal or Blank to skip\n\n  >> ").strip()
                 if not raw_val:
                     print("  Skipped.\n"); continue
                 new_val = _parse_val(raw_val)
@@ -1524,7 +1603,7 @@ EXAMPLE USAGE:\n
             if _apply_change(idx, new_val, patched):
                 status = decode_value(new_val, opts)
                 changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}  ({status})")
-                print(f"  New Value: {C_OK}{_fmt_value(new_val, s.size)}{C_RST}  ({C_STATUS}{status}{C_RST})\n")
+                print(f"\n  New Value Set : {C_OK}{_fmt_value(new_val, s.size)}{C_RST}  ({C_STATUS}{status}{C_RST})\n")
 
     # Save patched file
     if changes:
