@@ -17,7 +17,7 @@ To use this tool, extract the firmware from target EEPROM chip. You may specify 
 *The above image shows discovery of what settings the target NVRAM variable data controls*
 
 # Demo (Modifying values)
-![](https://github.com/PN-Tester/NVRAMap/blob/main/Mode_Modify.PNG)
+![](https://github.com/PN-Tester/NVRAMap/blob/main/Mode_modify.PNG)
 *The above image shows modification of pre-boot DMA Protection setting*
 
 # Usage
