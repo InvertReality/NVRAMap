@@ -122,6 +122,29 @@ EFI_SECTION_FIRMWARE_VOLUME_IMAGE = 0x17
 EFI_SECTION_DISPOSABLE            = 0x1B
 EFI_SECTION_AMD_LZMA              = 0x72
 
+# AMD AGESA CBS section types – contain sequential raw PE32 blobs after a
+# platform-specific header; not compressed, not encrypted.
+EFI_SECTION_AMD_CBS_E6            = 0xE6
+EFI_SECTION_AMD_CBS_F5            = 0xF5
+
+# AMD Pi BIOS-partition section types.  These AMD-specific outer section
+# types (0x51, 0x67, 0x77) wrap an LZMA-compressed DXE firmware volume.
+# Their EFI-style size field is UNRELIABLE and the LZMA stream may physically
+# span across multiple FFS files.  The LZMA data starts 40 bytes into the
+# section payload:
+#   [0:4]   section header  (type byte in [3], size bytes unreliable)
+#   [4:20]  16-byte AMD hash/nonce prefix
+#   [20:36] 16-byte AMD BIOS-Store GUID (see _AMD_BIOS_STORE_GUID_RAW)
+#   [36:40] 4-byte flags (typically 0x00010018)
+#   [40:]   LZMA FORMAT_ALONE stream (may overflow FFS boundary)
+EFI_SECTION_AMD_PI_0x51           = 0x51
+EFI_SECTION_AMD_PI_0x67           = 0x67
+EFI_SECTION_AMD_PI_0x77           = 0x77
+_AMD_PI_SECTION_TYPES             = frozenset((0x51, 0x67, 0x77))
+_AMD_PI_LZMA_HDR_OFFSET           = 40   # bytes from payload start to LZMA stream
+# The raw (on-disk) bytes of AMD BIOS-Store GUID 98584EEE-1439-5942-9D6E-DC7BD79403CF
+_AMD_BIOS_STORE_GUID_RAW          = bytes.fromhex("98584eee143959429d6edc7bd79403cf")
+
 # EFI_COMPRESSED_SECTION CompressionType values
 EFI_NOT_COMPRESSED       = 0x00
 EFI_STANDARD_COMPRESSION = 0x01   # Tiano
@@ -303,6 +326,63 @@ def _process_decompressed(decompressed: bytes, depth: int, label: str) -> List[b
     return blobs
 
 
+def _scan_raw_for_pe_blobs(raw: bytes, depth: int = 0,
+                            label: str = "") -> List[bytes]:
+    """Scan a raw byte region for embedded PE32/TE images by MZ signature.
+
+    Used for AMD CBS sections (0xE6, 0xF5) and similar containers that pack
+    multiple PE blobs sequentially without standard EFI section framing.
+    Each valid PE found is appended; its contents are also walked recursively
+    for nested FVs or section structures.
+    """
+    # First pass: collect offsets of all valid MZ/PE headers so we can cap sizes.
+    mz_offsets: List[int] = []
+    n = len(raw)
+    scan = 0
+    while scan < n - _MIN_PE_SIZE:
+        mp = raw.find(b'MZ', scan)
+        if mp < 0:
+            break
+        scan = mp + 1
+        if mp + 0x40 > n:
+            continue
+        e_lfanew = struct.unpack_from("<I", raw, mp + 0x3C)[0]
+        if not (0 < e_lfanew < 0x400):
+            continue
+        pe_hdr = mp + e_lfanew
+        if pe_hdr + 4 > n:
+            continue
+        if raw[pe_hdr: pe_hdr + 2] == b'PE':
+            mz_offsets.append(mp)
+
+    blobs: List[bytes] = []
+    seen: Set[int] = set()
+    for i, mp in enumerate(mz_offsets):
+        # Upper bound: start of the next valid MZ or end of region.
+        next_mz = mz_offsets[i + 1] if i + 1 < len(mz_offsets) else n
+        pe_hdr    = mp + struct.unpack_from("<I", raw, mp + 0x3C)[0]
+        opt_hdr_sz = struct.unpack_from("<H", raw, pe_hdr + 20)[0] if pe_hdr + 24 <= n else 0
+        img_size   = 0
+        if opt_hdr_sz >= 60 and pe_hdr + 24 + opt_hdr_sz <= n:
+            img_size = struct.unpack_from("<I", raw, pe_hdr + 24 + 56)[0]
+        # Use img_size only when it fits before the next MZ; otherwise span to next MZ.
+        if img_size >= _MIN_PE_SIZE and mp + img_size <= next_mz:
+            end = mp + img_size
+        else:
+            end = next_mz
+        blob = raw[mp:end]
+        if len(blob) < _MIN_PE_SIZE:
+            continue
+        h = hash(blob)
+        if h not in seen:
+            seen.add(h)
+            blobs.append(blob)
+            if DEBUG:
+                print(f"[dbg]{'  '*depth}  AMD_CBS PE blob @+{mp:#x}"
+                      f" size={len(blob):#x}  [{label}]")
+    return blobs
+
+
 def _collect_pe32_blobs_from_sections(sec_data: bytes, depth: int = 0,
                                        label: str = "") -> List[bytes]:
     if depth > 6:
@@ -350,9 +430,13 @@ def _collect_pe32_blobs_from_sections(sec_data: bytes, depth: int = 0,
                 continue
             sec_guid  = bytes(chunk[0:16])
             data_off2 = u16(chunk, 16)
-            if data_off2 > len(chunk):
+            # EFI spec: DataOffset is measured from the very start of the section
+            # (i.e. it includes the 4-byte size+type header that precedes `chunk`).
+            # Subtract 4 so the offset is relative to the start of `chunk`.
+            adj_off = data_off2 - 4
+            if adj_off < 0 or adj_off >= len(chunk):
                 continue
-            raw = chunk[data_off2:]
+            raw = chunk[adj_off:]
             if not raw:
                 continue
 
@@ -367,6 +451,21 @@ def _collect_pe32_blobs_from_sections(sec_data: bytes, depth: int = 0,
                 elif DEBUG:
                     print(f"[dbg]{'  '*depth}  GUID_DEFINED({sec_guid.hex()[:8]}…)"
                           f" {len(raw):#x} decompression failed")
+            elif sec_guid == _AMD_BIOS_STORE_GUID_RAW:
+                # AMD Pi BIOS-Store signed wrapper: the payload is LZMA-compressed
+                # (or occasionally plain FFS) after the signing header.
+                decompressed = _try_lzma(raw)
+                if decompressed:
+                    if DEBUG:
+                        print(f"[dbg]{'  '*depth}  AMD_BIOS_STORE GUID_DEF"
+                              f" {len(raw):#x} → {len(decompressed):#x}")
+                    blobs.extend(_process_decompressed(decompressed, depth+1, label))
+                else:
+                    # Might be plain (uncompressed but signed) – walk as sections
+                    blobs.extend(_collect_pe32_blobs_from_sections(raw, depth+1, label))
+                    if DEBUG:
+                        print(f"[dbg]{'  '*depth}  AMD_BIOS_STORE GUID_DEF"
+                              f" {len(raw):#x} plain/unknown, walked as sections")
             else:
                 decompressed = _try_decompress(raw)
                 if decompressed:
@@ -408,6 +507,17 @@ def _collect_pe32_blobs_from_sections(sec_data: bytes, depth: int = 0,
                         print(f"[dbg]{'  '*depth}  AMD_LZMA(0x72) {len(chunk):#x}"
                               f" decompression failed")
 
+        elif sec_type in (EFI_SECTION_AMD_CBS_E6, EFI_SECTION_AMD_CBS_F5):
+            # AMD AGESA CBS sections (0xE6 / 0xF5): raw containers holding one or
+            # more sequential PE32 images packed after a platform-specific header.
+            # There is no standard sub-section framing – scan for MZ/PE signatures
+            # directly, the same way _process_decompressed handles plain blobs.
+            if len(chunk) >= _MIN_PE_SIZE:
+                if DEBUG:
+                    print(f"[dbg]{'  '*depth}  AMD_CBS({sec_type:#04x})"
+                          f" {len(chunk):#x} bytes – scanning for PE blobs")
+                blobs.extend(_scan_raw_for_pe_blobs(chunk, depth, label))
+
     return blobs
 
 
@@ -430,6 +540,82 @@ def _find_all_fvs(data: bytes) -> List[Tuple[int, int, int]]:
     return results
 
 
+def _iter_ffs_files_with_offsets(fv_data: bytes, hdr_len: int) -> List[int]:
+    """Return the FV-relative byte offset of each payload returned by _iter_ffs_files.
+
+    The returned list is parallel to _iter_ffs_files(fv_data, hdr_len): entry i
+    is the byte offset *within fv_data* where the i-th FFS file's payload starts.
+    This lets callers feed fv_data[offset:] directly to LZMA even when the
+    compressed stream spans beyond the FFS file boundary.
+    """
+    offsets: List[int] = []
+    pos = (hdr_len + 7) & ~7
+    n   = len(fv_data)
+    itr = 0
+    while pos < n - 24 and itr < 65536:
+        itr += 1
+        if fv_data[pos] == 0xFF:
+            skip = pos + 8
+            while skip < n and fv_data[skip] == 0xFF:
+                skip += 8
+            if skip >= n:
+                break
+            pos = skip
+            continue
+        raw_size_b = fv_data[pos+20:pos+23]
+        raw_size   = raw_size_b[0] | (raw_size_b[1] << 8) | (raw_size_b[2] << 16)
+        ffs_attrs  = fv_data[pos+19]
+        large_file = (raw_size == _FFS_SIZE_LARGE) or bool(ffs_attrs & 0x01)
+        if large_file:
+            if pos + 32 > n:
+                break
+            raw_size  = u64(fv_data, pos + 24) if pos + 32 <= n else 0
+            hdr_bytes = 32
+        else:
+            hdr_bytes = 24
+        ffs_type = fv_data[pos+18]
+        if raw_size < hdr_bytes or raw_size > (n - pos):
+            pos += 8
+            continue
+        if ffs_type not in (0x00, 0xF0, 0xFF):
+            offsets.append(pos + hdr_bytes)   # payload starts here in fv_data
+        pos += (raw_size + 7) & ~7
+    return offsets
+
+
+def _extract_from_decompressed(decompressed: bytes,
+                                parent_label: str) -> List[Tuple[str, bytes]]:
+    """Walk a decompressed blob for FVs and PE32 modules; return (label, pe_blob) pairs."""
+    results: List[Tuple[str, bytes]] = []
+    seen: Set[int] = set()
+
+    def _add(lbl: str, blob: bytes) -> None:
+        h = hash(blob)
+        if h not in seen and len(blob) >= _MIN_PE_SIZE:
+            seen.add(h)
+            results.append((lbl, blob))
+
+    inner_fvs = _find_all_fvs(decompressed)
+    if inner_fvs:
+        for fv_b, fv_l, fv_h in inner_fvs:
+            fv_slice = decompressed[fv_b: fv_b + fv_l]
+            ffs_list = _iter_ffs_files(fv_slice, fv_h)
+            lbl = f"{parent_label}/decomp_FV@{fv_b:#x}"
+            if DEBUG:
+                print(f"[dbg]    decomp inner FV@{fv_b:#x} len={fv_l:#x}"
+                      f" {len(ffs_list)} FFS file(s)")
+            for fg, fp in ffs_list:
+                g    = guid_str(fg, 0)
+                flbl = f"{lbl}/{g}"
+                for blob in _collect_pe32_blobs_from_sections(fp, label=flbl):
+                    _add(flbl, blob)
+    else:
+        # No FV structure — try plain PE scan
+        for blob in _scan_raw_for_pe_blobs(decompressed, label=parent_label):
+            _add(parent_label, blob)
+    return results
+
+
 def extract_efi_blobs_from_firmware(fw_data: bytes) -> List[Tuple[str, bytes]]:
     results: List[Tuple[str, bytes]] = []
     seen_hashes: Set[int] = set()
@@ -445,9 +631,44 @@ def extract_efi_blobs_from_firmware(fw_data: bytes) -> List[Tuple[str, bytes]]:
             print(f"[dbg]   FV@{fv_base:#010x}  len={fv_len:#010x}  "
                   f"hdr={hdr_len:#x}  ffs_files={len(ffs_files)}")
 
-        for guid_bytes, payload in ffs_files:
+        # Track payload offsets so AMD Pi sections can feed the FV-level stream.
+        ffs_payload_offsets = _iter_ffs_files_with_offsets(fv_data, hdr_len)
+
+        for (guid_bytes, payload), payload_fv_offset in zip(ffs_files, ffs_payload_offsets):
             g     = guid_str(guid_bytes, 0)
             lbl   = f"FV@{fv_base:#010x}/{g}"
+
+            # ── AMD Pi BIOS-partition sections (0x51 / 0x67 / 0x77) ──────────
+            # These contain an LZMA-compressed DXE firmware volume whose
+            # compressed stream may span beyond the current FFS file boundary.
+            # Feed the entire FV data from the LZMA start offset so the
+            # decompressor can read across FFS boundaries naturally.
+            if len(payload) > _AMD_PI_LZMA_HDR_OFFSET:
+                sec_type = payload[3]
+                if sec_type in _AMD_PI_SECTION_TYPES:
+                    # Verify the AMD BIOS-Store GUID is present at [20:36].
+                    if payload[20:36] == _AMD_BIOS_STORE_GUID_RAW:
+                        lzma_abs = payload_fv_offset + _AMD_PI_LZMA_HDR_OFFSET
+                        import lzma as _lzma_mod
+                        try:
+                            decompressed = _lzma_mod.decompress(
+                                fv_data[lzma_abs:], format=_lzma_mod.FORMAT_ALONE)
+                            if DEBUG:
+                                print(f"[dbg]  AMD_PI({sec_type:#04x})"
+                                      f" LZMA FV+{lzma_abs:#x}"
+                                      f" → {len(decompressed):#x} bytes")
+                            for lbl2, blob in _extract_from_decompressed(
+                                    decompressed, lbl):
+                                h = hash(blob)
+                                if h not in seen_hashes:
+                                    seen_hashes.add(h)
+                                    results.append((lbl2, blob))
+                        except Exception as exc:
+                            if DEBUG:
+                                print(f"[dbg]  AMD_PI({sec_type:#04x})"
+                                      f" LZMA FV+{lzma_abs:#x} failed: {exc}")
+                        continue  # don't also walk as plain sections
+
             blobs = _collect_pe32_blobs_from_sections(payload, label=lbl)
             for blob in blobs:
                 h = hash(blob)
@@ -686,7 +907,10 @@ def debug_firmware_scan(fw_data: bytes) -> None:
 
                 elif sec_type == EFI_SECTION_GUID_DEFINED and len(chunk) >= 20:
                     doff2 = u16(chunk, 16)
-                    raw   = chunk[doff2:] if doff2 <= len(chunk) else b""
+                    # DataOffset is relative to the section start (includes the 4-byte
+                    # size+type prefix), so subtract 4 since `chunk` starts after it.
+                    adj = doff2 - 4
+                    raw   = chunk[adj:] if (0 <= adj < len(chunk)) else b""
                     if raw:
                         d = _try_decompress(raw)
                         if d:
@@ -700,10 +924,19 @@ def debug_firmware_scan(fw_data: bytes) -> None:
                         else:
                             decomp_fail += 1
 
+                elif sec_type in (EFI_SECTION_AMD_CBS_E6, EFI_SECTION_AMD_CBS_F5):
+                    inner = _scan_raw_for_pe_blobs(chunk)
+                    blob_count += len(inner)
+                    for b2 in inner:
+                        spkgs, fpkgs = find_packages(b2)
+                        if fpkgs:
+                            hii_count += 1
+
         type_names = {
             0x01: "COMPRESS", 0x02: "GUID_DEF", 0x10: "PE32",
             0x12: "TE", 0x15: "UI", 0x17: "FV_IMAGE",
-            0x19: "RAW", 0x1B: "DISPOSABLE",
+            0x19: "RAW", 0x1B: "DISPOSABLE", 0x72: "AMD_LZMA",
+            0xE6: "AMD_CBS_E6", 0xF5: "AMD_CBS_F5",
         }
         sec_summary = "  ".join(
             f"{type_names.get(t, f'0x{t:02X}')}×{c}"
@@ -2011,7 +2244,7 @@ EXAMPLE USAGE:
             else:
                 out_path.write_bytes(bytes(patched))
         print(f"\n{C_OK}  Saved → {out_path}{C_RST}")
-        for c in changes: print(f"    {c}")
+        #for c in changes: print(f"    {c}")
         print()
 
 
