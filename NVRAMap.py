@@ -1747,9 +1747,9 @@ EXAMPLE USAGE:
         prog="nvramap.py",
         description=(
             "NVRAMap — UEFI NVRAM Mapper & Editor\n\n"
-            "  When -efi is omitted and -firmware is given, all UEFI Firmware\n"
-            "  Volumes are scanned automatically and the richest HII-bearing\n"
-            "  module is selected.  Works with HP, Lenovo, and Dell firmware.\n"
+            "  Automatically discover relationships between settings and NVRAM\n"
+            "  Note when only -firmware is provided, NVRAMap will perform discovery\n"
+            "  This may take several minutes..\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog,
@@ -1760,22 +1760,22 @@ EXAMPLE USAGE:
     req.add_argument("-efi",  default=None, metavar="FILE",
                     help="EFI module with HII data (optional when -firmware is given)")
     req.add_argument("-nvram", default=None, metavar="FILE",
-                    help="Raw NVRAM binary blob")
+                    help="Raw NVRAM binary blob (optional when -firmware is given")
     req.add_argument("-firmware", default=None, metavar="FILE",
-                    help="Full firmware dump (NVRAM + HII modules located automatically)")
+                    help="Full firmware dump")
     m1 = ap.add_argument_group("mode 1 options")
     m1.add_argument("-terms", "-t", default=None, metavar="TERMS",
                     help="Comma-separated search terms  e.g. VT-d,IOMMU,DMA")
     m1.add_argument("-all", action="store_true",
                     help="Dump every setting (no filter)")
     m2 = ap.add_argument_group("mode 2 options")
-    m2.add_argument("-guid", default=None, metavar="GUID")
-    m2.add_argument("-key",  default=None, metavar="NAME")
+    m2.add_argument("-guid", default=None, metavar="GUID", help="GUID of target VarStore")
+    m2.add_argument("-key",  default=None, metavar="NAME", help="Name of target NVRAM Key")
     opt = ap.add_argument_group("options")
-    opt.add_argument("--modify",    action="store_true")
+    opt.add_argument("--modify",    action="store_true", help="Launch interactive editor")
     opt.add_argument("--set", nargs=2, metavar=("INDEX", "VALUE"))
     opt.add_argument("--extra-efi", nargs="+", default=[], metavar="FILE")
-    opt.add_argument("--dump-ifr",  default=None, metavar="FILE")
+    opt.add_argument("--dump-ifr",  default=None, metavar="FILE",help="Save extracted IFR data to file")
     opt.add_argument("--dump-var",  default=None, metavar="GUID")
     opt.add_argument("--list-hii",  action="store_true",
                     help="List all HII-bearing EFI modules found in firmware and exit")
