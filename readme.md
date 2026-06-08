@@ -6,7 +6,8 @@ There are two analysis modes:
   
 The tool is vendor agnostic and works against most modern UEFI implementations. The intended usage is to allow the user to quickly find and modify values related to important security settings when conducting physical penetration tests against UEFI firmware dumps. Once a setting is mapped, it's value can be overwritten and the resultant patched NVRAM can be flashed back onto the target computer's EEPROM chip to control firmware behaviour without requiring access to the pre-boot GUI or triggering a BitLocker recovery. Inspired by [research](https://www.mdsec.co.uk/2026/03/disabling-security-features-in-a-locked-bios/) published by [Craig Blackie](https://github.com/craigsblackie), this tool extracts IFR data from the target EFI module, parses it for relevant settings, then resolves each setting's VarStoreId to it's corresponding NVRAM GUID and Key name, before parsing the provided NVRAM or firmware dump to extract and display the values at the correct offsets. Each live value is mapped to the option string it represents in the IFR data and shown under the status column. This technique enables fast analysis of EFI modules or NVRAM Variable Stores. 
 
-To use this tool, extract the firmware from target EEPROM chip. You may specify extracted NVRAM or EFI programs to improve performance, or simply point NVRAMap at the full firmware dump and chose an analysis mode to begin automatic relationship discovery. In automatic mode, it may take a few minutes to perform full mapping. For modifications, simply use the ```--modify``` flag to launch the interactive editor. This mode will show additional information about targetted settings such as help strings and a list of valid options.
+To use this tool, extract the firmware from target EEPROM chip. You may specify extracted NVRAM or EFI programs to improve performance, or simply point NVRAMap at the full firmware dump and chose an analysis mode to begin automatic relationship discovery. In automatic mode, it may take a few minutes to perform full mapping. 
+For modifications, simply use the ```--modify``` flag to launch the interactive editor. This mode will show additional information about targeted settings such as help strings and a list of valid options.
 
 # Demo (mode 1 - EFI Settings to NVRAM analysis)
 ![](https://github.com/PN-Tester/NVRAMap/blob/main/Mode_1.PNG)
@@ -27,9 +28,9 @@ usage: nvramap.py [-h] -mode MODE [-efi FILE] [-nvram FILE] [-firmware FILE] [-t
 
 NVRAMap — UEFI NVRAM Mapper & Editor
 
-  When -efi is omitted and only -firmware is given, all UEFI Firmware
-  Volumes are scanned automatically for EFI module discovery. 
-  This may take several minutes.
+  Automatically discover relationships between settings and NVRAM
+  Note when only -firmware is provided, NVRAMap will perform discovery
+  This may take several minutes..
 
 options:
   -h, --help            show this help message and exit
@@ -37,8 +38,8 @@ options:
 required arguments:
   -mode MODE            Operation mode: 1 = EFI→NVRAM | 2 = NVRAM→EFI
   -efi FILE             EFI module with HII data (optional when -firmware is given)
-  -nvram FILE           Raw NVRAM binary blob (optional when -firmware is given)
-  -firmware FILE        Full firmware dump (NVRAM + HII modules located automatically)
+  -nvram FILE           Raw NVRAM binary blob (optional when -firmware is given
+  -firmware FILE        Full firmware dump
 
 mode 1 options:
   -terms TERMS, -t TERMS
@@ -46,14 +47,14 @@ mode 1 options:
   -all                  Dump every setting (no filter)
 
 mode 2 options:
-  -guid GUID            GUID of the VarStore you want to map
-  -key NAME             Name of the NVRAM Key you want to map
+  -guid GUID            GUID of target VarStore
+  -key NAME             Name of target NVRAM Key
 
 options:
-  --modify
+  --modify              Launch interactive editor
   --set INDEX VALUE
   --extra-efi FILE [FILE ...]
-  --dump-ifr FILE
+  --dump-ifr FILE       Save extracted IFR data to file
   --dump-var GUID
   --list-hii            List all HII-bearing EFI modules found in firmware and exit
   --debug-fw            Print detailed firmware structure scan (FVs, sections, decomp results) and exit
