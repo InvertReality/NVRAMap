@@ -1991,7 +1991,7 @@ EXAMPLE USAGE:
             if _apply_change(idx, new_val, patched):
                 status = decode_value(new_val, opts)
                 changes.append(f"[{idx+1}] {s.prompt}  →  {_fmt_value(new_val, s.size)}  ({status})")
-                print(f"  \nNew Value: {C_OK}{_fmt_value(new_val, s.size)}{C_RST}  ({C_STATUS}{status}{C_RST})\n")
+                print(f"\n  New Value: {C_OK}{_fmt_value(new_val, s.size)}{C_RST}  ({C_STATUS}{status}{C_RST})\n")
 
     if changes:
         if args.firmware:
