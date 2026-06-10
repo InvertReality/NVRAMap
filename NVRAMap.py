@@ -1822,6 +1822,24 @@ def print_varstore_map(settings, stores):
             rows.append([f"0x{s.var_store_id:X}", "?", "?"])
     print_table(["Store", "GUID", "Size"], rows, title="VARSTORE  →  GUID")
 
+def print_describe_table(settings, stores, title="SETTING DESCRIPTIONS"):
+    """Print help text for each matched setting as Setting/Help label pairs (outside of --modify flag)."""
+    lw   = 10   # label column width — pads "Setting:" and "Help:" to same indent
+    wrap = 120 # change this if you want narrower/wider description text; it will be wrapped to fit within this width
+    pad  = " " * lw
+
+    tlines = []
+    for i, s in enumerate(settings):
+        if tlines:
+            tlines.append("")
+        name = s.prompt[:43] + "…" if len(s.prompt) > 44 else s.prompt
+        desc = textwrap.wrap(s.help_text or "(no description available)", width=wrap) or [""]
+        tlines.append(f"{'Setting:':<{lw}}{name}")
+        tlines.append(f"{'Help:':<{lw}}{desc[0]}")
+        tlines.extend(f"{pad}{line}" for line in desc[1:])
+
+    _box(title, tlines)
+    print()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Extra EFI scanner
@@ -2010,6 +2028,9 @@ EXAMPLE USAGE:
     opt.add_argument("--extra-efi", nargs="+", default=[], metavar="FILE")
     opt.add_argument("--dump-ifr",  default=None, metavar="FILE",help="Save extracted IFR data to file")
     opt.add_argument("--dump-var",  default=None, metavar="GUID")
+
+    opt.add_argument("--setting-info", "-i", action="store_true",
+                    help="Print help text for each matched setting")
     opt.add_argument("--list-hii",  action="store_true",
                     help="List all HII-bearing EFI modules found in firmware and exit")
     opt.add_argument("--debug-fw",  action="store_true",
@@ -2125,6 +2146,10 @@ EXAMPLE USAGE:
 
     print_varstore_map(settings, stores)
     print_settings_table(settings, stores, title=title, oneof_options=oneof_options)
+
+    if args.setting_info:
+        desc_title = f"SETTING DESCRIPTIONS  ({args.terms})" if args.terms else "SETTING DESCRIPTIONS"
+        print_describe_table(settings, stores, title=desc_title)
 
     do_modify = args.modify; set_arg = args.set
 
